@@ -54,6 +54,7 @@ class Worker(object):
         self._last_file_mapping_update = {}
         self._logger = logger
         self._proc = None
+        self._seen_map ={}
         self._sincedb_path = self._beaver_config.get('sincedb_path')
         self._update_time = None
         self._running = True
@@ -170,6 +171,7 @@ class Worker(object):
                 current_line_count = len(lines)
                 if not self._sincedb_update_position(file, fid=fid, lines=current_line_count):
                     line_count += current_line_count
+            self._seen_map[fid]['file_offset'] = file.tell()
 
         if line_count > 0:
             self._sincedb_update_position(file, fid=fid, lines=line_count, force_update=True)
@@ -558,6 +560,7 @@ class Worker(object):
 
         if file:
             self._logger.info("[{0}] - un-watching logfile {1}".format(fid, file.name))
+            self._file_map[fid]['file'].close()
         else:
             self._logger.info("[{0}] - un-watching logfile".format(fid))
 
@@ -574,6 +577,11 @@ class Worker(object):
                 raise
         else:
             if file:
+                if fid in self._seen_map:
+                    file_offset = self._seen_map[fid].get('file_offset')
+                    if file_offset:
+                        file.seek(file_offset, os.SEEK_SET)
+
                 self._logger.info("[{0}] - watching logfile {1}".format(fid, fname))
                 self._file_map[fid] = {
                     'current_event': collections.deque([]),
@@ -590,6 +598,10 @@ class Worker(object):
                     'update_time': None,
                     'active': True,
                 }
+                self._seen_map[fid] = {
+                    'file_offset': file.tell()
+                }
+
 
     def open(self, filename, encoding=None):
         """Opens a file with the appropriate call"""
