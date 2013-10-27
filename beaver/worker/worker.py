@@ -536,10 +536,8 @@ class Worker(object):
             # Silently ignore any IOErrors -- file is gone
             pass
 
-
         if file:
             self._logger.info("[{0}] - un-watching logfile {1}".format(fid, file.name))
-
         else:
             self._logger.info("[{0}] - un-watching logfile".format(fid))
 
@@ -552,7 +550,6 @@ class Worker(object):
 
     def watch(self, fname):
         """Opens a file for log tailing"""
-
         try:
             file = self.open(fname, encoding=self._beaver_config.get_field('encoding', fname))
             if file:
