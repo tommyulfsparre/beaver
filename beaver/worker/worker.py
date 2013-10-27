@@ -71,6 +71,9 @@ class Worker(object):
 
     def close(self, signalnum=None, frame=None):
         self._running = False
+        """ Flush file offset to sincedb """
+        for fid, data in self._file_map.iteritems():
+            self._sincedb_update_position(data['file'], fid=fid, force_update=True)
         """Closes all currently open file pointers"""
         for id, data in self._file_map.iteritems():
             data['file'].close()
@@ -78,7 +81,6 @@ class Worker(object):
         if self._proc is not None and self._proc.is_alive():
             self._proc.terminate()
             self._proc.join()
-
 
     def listdir(self):
         """List directory and filter files by extension.
@@ -132,7 +134,6 @@ class Worker(object):
 
     def _run_pass(self, fid, file):
         """Read lines from a file and performs a callback against them"""
-        line_count = 0
         while True:
             try:
                 data = file.read(4096)
@@ -167,12 +168,7 @@ class Worker(object):
                 self._callback_wrapper(filename=file.name, lines=events)
 
             if self._sincedb_path:
-                current_line_count = len(lines)
-                if not self._sincedb_update_position(file, fid=fid, lines=current_line_count):
-                    line_count += current_line_count
-
-        if line_count > 0:
-            self._sincedb_update_position(file, fid=fid, lines=line_count, force_update=True)
+                self._sincedb_update_position(file, fid=fid)
 
     def _buffer_extract(self, data, fid):
         """
@@ -245,7 +241,6 @@ class Worker(object):
         # The first time we run the script we move all file markers at EOF.
         # In case of files created afterwards we don't do this.
         for fid, data in self._file_map.iteritems():
-            self._logger.debug("[{0}] - getting start position {1}".format(fid, data['file'].name))
             start_position = self._beaver_config.get_field('start_position', data['file'].name)
             is_active = data['active']
 
@@ -253,7 +248,12 @@ class Worker(object):
                 sincedb_start_position = self._sincedb_start_position(data['file'], fid=fid)
                 if sincedb_start_position:
                     start_position = sincedb_start_position
+                else:
+                    """ We didn't find the fid in sincedb. Might have been created while
+                        Beaver wasn't running """
+                    start_position = "beginning"
 
+            self._logger.debug("[{0}] - position: {1}".format(fid, start_position))
             if start_position == "beginning":
                 continue
 
@@ -262,27 +262,13 @@ class Worker(object):
             if str(start_position).isdigit():
                 self._logger.debug("[{0}] - going to start position {1} for {2}".format(fid, start_position, data['file'].name))
                 start_position = int(start_position)
-                for encoding in ENCODINGS:
-                    try:
-                        line_count = 0
-                        while data['file'].readline():
-                            line_count += 1
-                            if line_count == start_position:
-                                break
-                    except UnicodeDecodeError:
-                        self._logger.debug("[{0}] - UnicodeDecodeError raised for {1} with encoding {2}".format(fid, data['file'].name, data['encoding']))
-                        data['file'] = self.open(data['file'].name, encoding=encoding)
-                        if not data['file']:
-                            unwatch_list.append(fid)
-                            is_active = False
-                            break
-
-                        data['encoding'] = encoding
-
-                    if line_count != start_position:
-                        self._logger.debug("[{0}] - file at different position than {1}, assuming manual truncate for {2}".format(fid, start_position, data['file'].name))
-                        data['file'].seek(0, os.SEEK_SET)
-                        start_position == "beginning"
+                if os.stat(data['file'].name).st_size < start_position:
+                    self._logger.debug("[{0}] - file at different position than {1}, assuming manual truncate for {2}".format(fid, start_position, data['file'].name))
+                    data['file'].seek(0, os.SEEK_SET)
+                    start_position == "beginning"
+                else:
+                    self._logger.debug("[{0}] - Starting at {1}".format(fid, start_position))
+                    data['file'].seek(start_position, os.SEEK_SET)
 
             if not is_active:
                 continue
@@ -313,7 +299,7 @@ class Worker(object):
 
             current_position = data['file'].tell()
             self._logger.debug("[{0}] - line count {1} for {2}".format(fid, line_count, data['file'].name))
-            self._sincedb_update_position(data['file'], fid=fid, lines=line_count, force_update=True)
+            self._sincedb_update_position(data['file'], fid=fid, force_update=True)
 
             tail_lines = self._beaver_config.get_field('tail_lines', data['file'].name)
             tail_lines = int(tail_lines)
@@ -364,7 +350,7 @@ class Worker(object):
             """)
             conn.close()
 
-    def _sincedb_update_position(self, file, fid=None, lines=0, force_update=False):
+    def _sincedb_update_position(self, file, fid=None, force_update=False):
         """Retrieves the starting position from the sincedb sql db for a given file
         Returns a boolean representing whether or not it updated the record
         """
@@ -381,21 +367,16 @@ class Worker(object):
             if update_time and current_time - update_time <= sincedb_write_interval:
                 return False
 
-            if lines == 0:
-                return False
-
         self._sincedb_init()
-
-        old_count = self._file_map[fid]['line']
+        file_offset = self._file_map[fid]['file'].tell()
+        self._file_map[fid]['file_offset'] = file_offset
         self._file_map[fid]['update_time'] = current_time
-        self._file_map[fid]['line'] = old_count + lines
-        lines = self._file_map[fid]['line']
 
-        self._logger.debug("[{0}] - updating sincedb for logfile {1} from {2} to {3}".format(fid, file.name, old_count, lines))
+        self._logger.debug("[{0}] - updating sincedb for logfile {1} to offset {2}".format(fid, file.name, file_offset))
 
         conn = sqlite3.connect(self._sincedb_path, isolation_level=None)
         cursor = conn.cursor()
-        query = "insert or ignore into sincedb (fid, filename) values (:fid, :filename);"
+        query = "insert or replace into sincedb (fid, filename) values (:fid, :filename);"
         cursor.execute(query, {
             'fid': fid,
             'filename': file.name
@@ -405,7 +386,7 @@ class Worker(object):
         cursor.execute(query, {
             'fid': fid,
             'filename': file.name,
-            'position': int(lines),
+            'position': file_offset,
         })
         conn.close()
 
@@ -424,9 +405,8 @@ class Worker(object):
         self._sincedb_init()
         conn = sqlite3.connect(self._sincedb_path, isolation_level=None)
         cursor = conn.cursor()
-        cursor.execute("select position from sincedb where fid = :fid and filename = :filename", {
-            'fid': fid,
-            'filename': file.name
+        cursor.execute("select position from sincedb where fid = :fid", {
+            'fid': fid
         })
 
         start_position = None
@@ -556,15 +536,23 @@ class Worker(object):
             # Silently ignore any IOErrors -- file is gone
             pass
 
+
         if file:
             self._logger.info("[{0}] - un-watching logfile {1}".format(fid, file.name))
+
         else:
             self._logger.info("[{0}] - un-watching logfile".format(fid))
 
+        # Flush before unwatch
+        self._sincedb_update_position(file, fid=fid, force_update=True)
+
+        # Clean up
+        self._file_map[fid]['file'].close()
         del self._file_map[fid]
 
     def watch(self, fname):
         """Opens a file for log tailing"""
+
         try:
             file = self.open(fname, encoding=self._beaver_config.get_field('encoding', fname))
             if file:
@@ -574,6 +562,12 @@ class Worker(object):
                 raise
         else:
             if file:
+                file_offset = self._sincedb_start_position(file, fid)
+                # Have we seen this file before.
+                if file_offset:
+                    file.seek(file_offset, os.SEEK_SET)
+                else:
+                    file_offset = file.tell()
                 self._logger.info("[{0}] - watching logfile {1}".format(fid, fname))
                 self._file_map[fid] = {
                     'current_event': collections.deque([]),
@@ -583,7 +577,7 @@ class Worker(object):
                     'input': collections.deque([]),
                     'input_size': 0,
                     'last_activity': time.time(),
-                    'line': 0,
+                    'file_offset': file_offset,
                     'multiline_regex_after': self._beaver_config.get_field('multiline_regex_after', fname),
                     'multiline_regex_before': self._beaver_config.get_field('multiline_regex_before', fname),
                     'size_limit': self._beaver_config.get_field('size_limit', fname),
